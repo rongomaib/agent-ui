@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent Studio — Focus-app</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body, #root { height: 100%; margin: 0; }
+    body { background: #0a0a0a; color: #e5e5e5; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+    ::-webkit-scrollbar-thumb:hover { background: #444; }
+
+    .phone-frame {
+      border: 10px solid #1c1c1e;
+      border-radius: 44px;
+      box-shadow: 0 0 0 1px #3a3a3c, inset 0 0 0 1px #000, 0 32px 80px rgba(0,0,0,0.7);
+      overflow: hidden;
+      width: 393px;
+      flex-shrink: 0;
+    }
+    .phone-frame::before {
+      content: '';
+      display: block;
+      width: 120px;
+      height: 34px;
+      background: #1c1c1e;
+      border-radius: 0 0 20px 20px;
+      margin: 0 auto;
+    }
+    .phone-frame iframe { width: 393px; height: 800px; border: none; display: block; }
+
+    .msg-pre { white-space: pre-wrap; word-break: break-word; font-family: inherit; margin: 0; font-size: 13px; line-height: 1.6; }
+    .msg-pre code { background: #1e293b; padding: 1px 5px; border-radius: 3px; font-family: monospace; }
+
+    .typing-dot::after { content: '▋'; animation: blink 1s step-end infinite; opacity: 1; }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    textarea { field-sizing: content; min-height: 20px; max-height: 96px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+async function api(path, method = 'GET', body = null) {
+  const opts = { method, headers: {} };
+  if (body !== null) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opts);
+  return r.json();
+}
+
+async function streamMessage(agentId, content, onEvent) {
+  console.log(`[stream] → agent ${agentId}:`, content);
+  const r = await fetch(`/api/agents/${agentId}/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+  console.log(`[stream] response status:`, r.status);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) { console.log(`[stream] reader done`); break; }
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        try {
+          const ev = JSON.parse(line.slice(6));
+          console.log(`[stream] event:`, ev);
+          onEvent(ev);
+        } catch (e) {
+          console.warn(`[stream] parse error on line:`, line, e);
+        }
+      }
+    }
+  }
+  console.log(`[stream] finished`);
+}
+
+// ─── Toast ──────────────────────────────────────────────────────────────────
+function Toast({ message, type, onClose }) {
+  useEffect(() => { const t = setTimeout(onClose, 4000); return () => clearTimeout(t); }, []);
+  return (
+    <div className={`fixed bottom-4 right-4 z-50 px-4 py-2.5 rounded-xl border text-sm shadow-2xl flex items-center gap-2 ${
+      type === 'error' ? 'bg-red-950 border-red-800 text-red-200' : 'bg-[#1a1a1a] border-[#2a2a2a] text-gray-200'
+    }`}>
+      <span>{message}</span>
+      <button onClick={onClose} className="text-gray-500 hover:text-gray-300 ml-1">✕</button>
+    </div>
+  );
+}
+
+// ─── New Agent Modal ─────────────────────────────────────────────────────────
+const MODELS = [
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 — fast, low cost' },
+  { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6 — balanced' },
+  { id: 'claude-opus-4-7',           label: 'Opus 4.7 — most capable' },
+];
+
+function NewAgentModal({ onClose, onCreate }) {
+  const [name, setName] = useState('');
+  const [branch, setBranch] = useState('');
+  const [model, setModel] = useState('claude-sonnet-4-6');
+  const auto = name ? `agent/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
+
+  const submit = () => { if (name) onCreate(name, branch || auto, model); };
+  const onKey = e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') onClose(); };
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70" onClick={onClose}>
+      <div className="bg-[#141414] border border-[#2a2a2a] rounded-2xl p-6 w-96 shadow-2xl" onClick={e => e.stopPropagation()}>
+        <h2 className="text-base font-semibold mb-5">New Agent</h2>
+
+        <label className="block text-xs text-gray-500 mb-1.5">Agent name</label>
+        <input autoFocus onKeyDown={onKey}
+          className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm mb-4 focus:outline-none focus:border-indigo-500 transition-colors"
+          placeholder="e.g. UI Fixer, Auth Agent…"
+          value={name} onChange={e => setName(e.target.value)}
+        />
+
+        <label className="block text-xs text-gray-500 mb-1.5">Model</label>
+        <select value={model} onChange={e => setModel(e.target.value)}
+          className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm mb-4 focus:outline-none focus:border-indigo-500 transition-colors">
+          {MODELS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+        </select>
+
+        <label className="block text-xs text-gray-500 mb-1.5">Branch name</label>
+        <input onKeyDown={onKey}
+          className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm mb-1 focus:outline-none focus:border-indigo-500 transition-colors font-mono text-xs"
+          placeholder={auto || 'agent/my-branch'}
+          value={branch} onChange={e => setBranch(e.target.value)}
+        />
+        <p className="text-xs text-gray-600 mb-5">Leave blank to auto-generate from name</p>
+
+        <div className="flex gap-2 justify-end">
+          <button onClick={onClose} className="px-4 py-2 text-sm rounded-xl bg-[#1e1e1e] hover:bg-[#2a2a2a] transition-colors">Cancel</button>
+          <button onClick={submit} disabled={!name}
+            className="px-4 py-2 text-sm rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 transition-colors">
+            Create Agent
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── PR Modal ────────────────────────────────────────────────────────────────
+function PRModal({ currentBranch, onClose, onCreate }) {
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [base, setBase] = useState('main');
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70" onClick={onClose}>
+      <div className="bg-[#141414] border border-[#2a2a2a] rounded-2xl p-6 w-[500px] shadow-2xl" onClick={e => e.stopPropagation()}>
+        <h2 className="text-base font-semibold mb-5">Create Pull Request</h2>
+
+        <div className="flex items-center gap-2 mb-4 text-xs font-mono">
+          <span className="px-2 py-1 bg-blue-950 text-blue-300 rounded-lg">{currentBranch}</span>
+          <span className="text-gray-600">→</span>
+          <input
+            className="bg-[#0d0d0d] border border-[#2a2a2a] rounded-lg px-2 py-1 text-xs font-mono w-24 focus:outline-none focus:border-indigo-500"
+            value={base} onChange={e => setBase(e.target.value)}
+          />
+        </div>
+
+        <input autoFocus
+          className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm mb-3 focus:outline-none focus:border-indigo-500 transition-colors"
+          placeholder="PR title…"
+          value={title} onChange={e => setTitle(e.target.value)}
+        />
+        <textarea
+          className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm mb-5 focus:outline-none focus:border-indigo-500 transition-colors resize-none h-24"
+          placeholder="Description (optional)…"
+          value={body} onChange={e => setBody(e.target.value)}
+        />
+
+        <div className="flex gap-2 justify-end">
+          <button onClick={onClose} className="px-4 py-2 text-sm rounded-xl bg-[#1e1e1e] hover:bg-[#2a2a2a] transition-colors">Cancel</button>
+          <button onClick={() => onCreate(title, body, currentBranch, base)} disabled={!title}
+            className="px-4 py-2 text-sm rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 transition-colors">
+            Create PR
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Agent Panel ─────────────────────────────────────────────────────────────
+function AgentPanel({ agent, onDelete, onPush, onClose, onMerge }) {
+  const [messages, setMessages] = useState(
+    (agent.messages || []).map(m => ({ ...m, id: Math.random() }))
+  );
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const bottomRef = useRef(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const addMsg = (role, content, type = 'text') =>
+    setMessages(p => [...p, { id: Math.random(), role, content, type, streaming: false }]);
+
+  const appendToLast = text =>
+    setMessages(p => {
+      const msgs = [...p];
+      const last = msgs[msgs.length - 1];
+      if (last?.role === 'assistant' && last.type === 'text') {
+        msgs[msgs.length - 1] = { ...last, content: last.content + text, streaming: true };
+      } else {
+        msgs.push({ id: Math.random(), role: 'assistant', content: text, type: 'text', streaming: true });
+      }
+      return msgs;
+    });
+
+  const finalizeStream = () =>
+    setMessages(p => {
+      const msgs = [...p];
+      if (msgs.length && msgs[msgs.length - 1].role === 'assistant') {
+        msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], streaming: false };
+      }
+      return msgs;
+    });
+
+  const sendSummaryRequest = async () => {
+    const sid = Math.random();
+    setMessages(p => [...p, { id: sid, role: 'assistant', content: '', type: 'summary', streaming: true }]);
+    try {
+      await streamMessage(agent.id, 'In one sentence, briefly summarize what you just did.', ev => {
+        if (ev.type === 'text') {
+          setMessages(p => {
+            const msgs = [...p];
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              if (msgs[i].type === 'summary') { msgs[i] = { ...msgs[i], content: msgs[i].content + ev.text }; break; }
+            }
+            return msgs;
+          });
+        } else if (ev.type === 'done') {
+          setMessages(p => {
+            const msgs = [...p];
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              if (msgs[i].type === 'summary') { msgs[i] = { ...msgs[i], streaming: false }; break; }
+            }
+            return msgs;
+          });
+        }
+      });
+    } catch {
+      setMessages(p => p.filter(m => m.id !== sid));
+    }
+  };
+
+  const send = async () => {
+    const msg = input.trim();
+    if (!msg || busy) return;
+    setInput('');
+    setBusy(true);
+    addMsg('user', msg);
+    console.log(`[agent:${agent.id}] sending:`, msg);
+    try {
+      await streamMessage(agent.id, msg, ev => {
+        if (ev.type === 'text') appendToLast(ev.text);
+        else if (ev.type === 'tool_start') { console.log(`[agent:${agent.id}] tool start:`, ev.name); addMsg('tool', `Running ${ev.name}…`, 'tool_start'); }
+        else if (ev.type === 'tool_result') { console.log(`[agent:${agent.id}] tool result:`, ev.name, ev.result?.slice(0, 100)); addMsg('tool', `${ev.name} → ${ev.result}`, 'tool_result'); }
+        else if (ev.type === 'done') { console.log(`[agent:${agent.id}] done`); finalizeStream(); }
+        else if (ev.type === 'error') { console.error(`[agent:${agent.id}] error:`, ev.text); addMsg('assistant', `Error: ${ev.text}`, 'error'); }
+      });
+      await sendSummaryRequest();
+    } catch (e) {
+      console.error(`[agent:${agent.id}] connection error:`, e);
+      addMsg('assistant', `Connection error: ${e.message}`, 'error');
+    } finally {
+      console.log(`[agent:${agent.id}] busy cleared`);
+      setBusy(false);
+    }
+  };
+
+  const onKey = e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  };
+
+  const renderMessage = msg => {
+    if (msg.type === 'tool_start') return (
+      <div key={msg.id} className="flex items-center gap-2 py-1 px-2 text-xs text-indigo-400 my-0.5">
+        <svg className="w-3 h-3 spin flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+          <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round"/>
+        </svg>
+        {msg.content}
+      </div>
+    );
+
+    if (msg.type === 'tool_result') return (
+      <div key={msg.id} className="mx-2 my-1 px-3 py-2 bg-[#0d1117] border border-[#1e293b] rounded-lg text-xs font-mono text-slate-400 overflow-x-auto">
+        <pre className="msg-pre">{msg.content}</pre>
+      </div>
+    );
+
+    if (msg.type === 'summary') return (
+      <div key={msg.id} className="flex items-start gap-1.5 mb-3 px-2">
+        <span className="text-[9px] font-semibold text-emerald-600 uppercase tracking-wider mt-1.5 flex-shrink-0">✓ done</span>
+        <div className={`flex-1 px-2.5 py-1.5 bg-[#0f1a0f] border border-emerald-900/50 rounded-xl text-xs text-emerald-300/70 ${msg.streaming ? 'typing-dot' : ''}`}>
+          <pre className="msg-pre">{msg.content}</pre>
+        </div>
+      </div>
+    );
+
+    if (msg.role === 'user') return (
+      <div key={msg.id} className="flex justify-end mb-2 px-2">
+        <div className="max-w-[88%] px-3 py-2 bg-indigo-600 rounded-2xl rounded-tr-md text-sm">
+          {msg.content}
+        </div>
+      </div>
+    );
+
+    return (
+      <div key={msg.id} className="flex justify-start mb-2 px-2">
+        <div className={`max-w-[92%] px-3 py-2 bg-[#1e1e1e] rounded-2xl rounded-tl-md text-sm ${msg.type === 'error' ? 'text-red-400' : ''} ${msg.streaming ? 'typing-dot' : ''}`}>
+          <pre className="msg-pre">{msg.content}</pre>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex flex-col w-72 flex-shrink-0 bg-[#111] border border-[#222] rounded-2xl overflow-hidden">
+      {/* Header */}
+      <div className="flex items-start justify-between px-3 py-2.5 border-b border-[#1e1e1e]">
+        <div>
+          <div className="text-sm font-medium">{agent.name}</div>
+          <span className="text-[10px] px-1.5 py-0.5 bg-blue-950/60 text-blue-400 rounded font-mono inline-block mt-1">
+            {agent.branch}
+          </span>
+        </div>
+        <div className="flex items-center gap-1 mt-0.5">
+          <button onClick={() => onPush(agent.branch)}
+            className="text-[11px] px-2 py-1 rounded-lg text-gray-500 hover:text-white hover:bg-[#2a2a2a] transition-colors">
+            ↑ push
+          </button>
+          <button onClick={() => onMerge(agent.branch)}
+            className="text-[11px] px-2 py-1 rounded-lg text-gray-500 hover:text-green-400 hover:bg-green-950/30 transition-colors">
+            → main
+          </button>
+          <button onClick={onClose}
+            title="Close panel"
+            className="p-1 rounded-lg text-gray-600 hover:text-white hover:bg-[#2a2a2a] transition-colors text-sm">
+            ✕
+          </button>
+          <button onClick={() => { if (confirm(`Delete agent "${agent.name}"?`)) onDelete(agent.id); }}
+            title="Delete agent"
+            className="p-1 rounded-lg text-gray-600 hover:text-red-400 hover:bg-red-950/30 transition-colors text-xs">
+            🗑
+          </button>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto py-2 min-h-0">
+        {messages.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full text-center text-gray-700 gap-2 py-8">
+            <div className="text-2xl">⚡</div>
+            <div className="text-xs">Give me a task</div>
+          </div>
+        )}
+        {messages.map(renderMessage)}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* Input */}
+      <div className="p-2 border-t border-[#1e1e1e]">
+        <div className="flex items-end gap-2 bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 focus-within:border-indigo-600 transition-colors">
+          <textarea ref={inputRef} rows={1}
+            className="flex-1 bg-transparent text-sm resize-none focus:outline-none placeholder-gray-700"
+            placeholder={busy ? 'Working…' : 'Give a task…'}
+            value={input} onChange={e => setInput(e.target.value)} onKeyDown={onKey}
+            disabled={busy}
+          />
+          <button onClick={send} disabled={!input.trim() || busy}
+            className="p-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 rounded-lg flex-shrink-0 transition-colors">
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <path d="M22 2L11 13M22 2 15 22 11 13 2 9l20-7z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Branch Switcher ─────────────────────────────────────────────────────────
+function BranchSwitcher({ currentBranch, dirty, onSwitch }) {
+  const [branches, setBranches] = useState([]);
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (open) api('/api/git/branches').then(d => setBranches(d.branches || [])).catch(() => {});
+  }, [open]);
+
+  useEffect(() => {
+    const handler = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  return (
+    <div ref={ref} className="relative">
+      <button onClick={() => setOpen(v => !v)}
+        className="flex items-center gap-1.5 px-2.5 py-1 bg-[#161616] border border-[#2a2a2a] rounded-lg text-xs font-mono text-gray-300 hover:border-gray-500 transition-colors">
+        <span className="text-green-500 text-[10px]">⎇</span>
+        {currentBranch || 'main'}
+        {dirty && <span className="w-1.5 h-1.5 rounded-full bg-yellow-400" title="Uncommitted changes" />}
+        <span className="text-gray-600 ml-0.5">▾</span>
+      </button>
+      {open && (
+        <div className="absolute top-full left-0 mt-1 z-50 bg-[#161616] border border-[#2a2a2a] rounded-xl shadow-2xl w-56 max-h-64 overflow-y-auto py-1">
+          {branches.length === 0
+            ? <div className="px-3 py-2 text-xs text-gray-600">Loading…</div>
+            : branches.map(b => (
+              <button key={b} onClick={() => { onSwitch(b); setOpen(false); }}
+                className={`w-full text-left px-3 py-1.5 text-xs font-mono transition-colors ${b === currentBranch ? 'text-indigo-400 bg-indigo-950/30' : 'text-gray-400 hover:text-white hover:bg-[#222]'}`}>
+                {b === currentBranch && <span className="mr-1">✓</span>}{b}
+              </button>
+            ))
+          }
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+function App() {
+  const [agentList, setAgentList] = useState([]);
+  const [openAgents, setOpenAgents] = useState(new Set());
+  const [gitInfo, setGitInfo]     = useState({ branch: '…', status: '' });
+  const [viewMode, setViewMode]   = useState('desktop');
+  const [appRunning, setAppRunning] = useState(false);
+  const [appStarting, setAppStarting] = useState(false);
+  const [appLogs, setAppLogs]     = useState([]);
+  const [showLogs, setShowLogs]   = useState(false);
+  const [showNewAgent, setShowNewAgent] = useState(false);
+  const [showPR, setShowPR]       = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [commits, setCommits]     = useState([]);
+  const [toast, setToast]         = useState(null);
+  const iframeRef = useRef(null);
+  const logsEndRef = useRef(null);
+  const logPollRef = useRef(null);
+
+  const notify = (msg, type = 'success') => setToast({ message: msg, type });
+
+  useEffect(() => {
+    refreshGit();
+    checkApp();
+    loadAgents();
+    const t = setInterval(refreshGit, 10000);
+    return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [appLogs]);
+
+  const startLogPolling = () => {
+    if (logPollRef.current) clearInterval(logPollRef.current);
+    logPollRef.current = setInterval(async () => {
+      try {
+        const d = await api('/api/app/logs');
+        setAppLogs(d.logs || []);
+        if (d.running) {
+          setAppRunning(true);
+          setAppStarting(false);
+          clearInterval(logPollRef.current);
+        } else if (d.exit_code !== null && d.exit_code !== undefined) {
+          // Process exited
+          setAppRunning(false);
+          setAppStarting(false);
+          clearInterval(logPollRef.current);
+        }
+      } catch {}
+    }, 1000);
+  };
+
+  const stopLogPolling = () => {
+    if (logPollRef.current) { clearInterval(logPollRef.current); logPollRef.current = null; }
+  };
+
+  const refreshGit = async () => {
+    try { setGitInfo(await api('/api/git/status')); } catch {}
+  };
+  const checkApp = async () => {
+    try {
+      const d = await api('/api/app/status');
+      setAppRunning(d.running);
+    } catch {}
+  };
+  const loadAgents = async () => {
+    try {
+      const d = await api('/api/agents');
+      setAgentList(d.agents);
+      setOpenAgents(new Set(d.agents.map(a => a.id)));
+    } catch {}
+  };
+
+  const handlePull = async () => {
+    try {
+      const d = await api('/api/git/pull', 'POST');
+      notify(d.output || 'Up to date');
+      refreshGit();
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const handlePush = async branch => {
+    try {
+      const d = await api('/api/git/push', 'POST', { branch });
+      notify(d.output || `Pushed ${branch}`);
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const handleCreateAgent = async (name, branch, model) => {
+    try {
+      const agent = await api('/api/agents', 'POST', { name, branch, model });
+      setAgentList(p => [...p, agent]);
+      setOpenAgents(p => new Set([...p, agent.id]));
+      setShowNewAgent(false);
+      notify(`Agent "${name}" on ${agent.branch}`);
+      refreshGit();
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const toggleAgent = id =>
+    setOpenAgents(p => {
+      const next = new Set(p);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+  const handleDeleteAgent = async id => {
+    try {
+      await api(`/api/agents/${id}`, 'DELETE');
+      setAgentList(p => p.filter(a => a.id !== id));
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const handleCheckout = async (branch) => {
+    try {
+      await api('/api/git/checkout', 'POST', { branch });
+      refreshGit();
+      notify(`Switched to ${branch}`);
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const handleMergeToMain = async (branch) => {
+    notify(`Merging ${branch} → main…`);
+    try {
+      const d = await api('/api/git/merge-to-main', 'POST', { branch });
+      if (d.ok) { notify(`Merged ${branch} → main and pushed`); refreshGit(); }
+      else notify(d.error || 'Merge failed', 'error');
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const loadHistory = async () => {
+    try {
+      const d = await api('/api/git/log');
+      setCommits(d.commits || []);
+    } catch {}
+  };
+
+  const handleRevert = async (hash, message) => {
+    if (!confirm(`Revert "${message}"?\nThis creates a new commit that undoes it and pushes to main.`)) return;
+    notify('Reverting…');
+    try {
+      const d = await api('/api/git/revert', 'POST', { commit: hash });
+      if (d.ok) { notify('Reverted and pushed to main'); loadHistory(); refreshGit(); }
+      else notify(d.error || 'Revert failed', 'error');
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const handleCreatePR = async (title, body, head, base) => {
+    try {
+      const d = await api('/api/github/pr', 'POST', { title, body, head, base });
+      if (d.url) { notify(`PR #${d.number} created`); window.open(d.url, '_blank'); }
+      else notify(d.error || 'PR failed', 'error');
+      setShowPR(false);
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const toggleApp = async () => {
+    try {
+      if (appRunning) {
+        await api('/api/app/stop', 'POST');
+        setAppRunning(false);
+        stopLogPolling();
+      } else {
+        setAppStarting(true);
+        setAppLogs([]);
+        setShowLogs(true);
+        const d = await api('/api/app/start', 'POST');
+        if (d.status === 'error') {
+          notify(d.error, 'error');
+          setAppStarting(false);
+        } else {
+          startLogPolling();
+        }
+      }
+    } catch (e) {
+      notify(e.message, 'error');
+      setAppStarting(false);
+    }
+  };
+
+  const refreshPreview = () => {
+    try { iframeRef.current.src = iframeRef.current.src; } catch {}
+  };
+
+  const dirty = gitInfo.status?.trim().length > 0;
+
+  return (
+    <div className="flex flex-col h-screen overflow-hidden bg-[#0a0a0a]">
+
+      {/* ── Top bar ── */}
+      <header className="flex items-center gap-2 px-4 h-12 border-b border-[#1e1e1e] bg-[#0d0d0d] flex-shrink-0">
+        {/* Logo + repo */}
+        <div className="flex items-center gap-1.5 mr-3">
+          <div className="w-2 h-2 rounded-full bg-indigo-500 flex-shrink-0" />
+          <span className="text-sm font-semibold">Agent Studio</span>
+          <span className="text-gray-700 mx-0.5">/</span>
+          <span className="text-gray-400 text-sm">Focus-app</span>
+        </div>
+
+        {/* Branch switcher */}
+        <BranchSwitcher currentBranch={gitInfo.branch} dirty={dirty} onSwitch={handleCheckout} />
+
+        <div className="flex-1" />
+
+        {/* Device toggle */}
+        <div className="flex bg-[#161616] border border-[#2a2a2a] rounded-lg overflow-hidden text-xs">
+          {['desktop','mobile'].map(m => (
+            <button key={m} onClick={() => setViewMode(m)}
+              className={`px-3 py-1.5 capitalize transition-colors ${viewMode === m ? 'bg-[#2a2a2a] text-white' : 'text-gray-500 hover:text-gray-300'}`}>
+              {m}
+            </button>
+          ))}
+        </div>
+
+        {/* App toggle */}
+        <button onClick={toggleApp} disabled={appStarting}
+          className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+            appRunning
+              ? 'border-green-800 text-green-400 bg-green-950/50 hover:bg-green-950'
+              : appStarting
+              ? 'border-yellow-800 text-yellow-400 bg-yellow-950/30 cursor-wait'
+              : 'border-[#2a2a2a] text-gray-400 hover:text-white hover:bg-[#1e1e1e]'
+          }`}>
+          {appRunning ? '● Running' : appStarting ? '◌ Starting…' : '▶ Start'}
+        </button>
+
+        <button onClick={handlePull}
+          className="px-3 py-1.5 text-xs rounded-lg border border-[#2a2a2a] text-gray-400 hover:text-white hover:bg-[#1e1e1e] transition-colors">
+          ↓ Pull
+        </button>
+
+        <button onClick={() => setShowPR(true)}
+          className="px-3 py-1.5 text-xs rounded-lg border border-indigo-900 text-indigo-400 hover:bg-indigo-950/50 transition-colors">
+          ⊕ PR
+        </button>
+        <button onClick={() => { loadHistory(); setShowHistory(v => !v); }}
+          className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${showHistory ? 'border-gray-600 text-white bg-[#1e1e1e]' : 'border-[#2a2a2a] text-gray-400 hover:text-white hover:bg-[#1e1e1e]'}`}>
+          ↩ History
+        </button>
+      </header>
+
+      {/* ── History panel ── */}
+      {showHistory && (
+        <div className="border-b border-[#1e1e1e] bg-[#0d0d0d] flex-shrink-0 max-h-48 overflow-y-auto">
+          {commits.length === 0
+            ? <div className="px-4 py-3 text-xs text-gray-600">No commits found on main</div>
+            : commits.map(c => (
+              <div key={c.hash} className="flex items-center gap-3 px-4 py-1.5 hover:bg-[#111] group border-b border-[#141414]">
+                <span className="font-mono text-[10px] text-gray-600 flex-shrink-0">{c.hash}</span>
+                <span className="text-xs text-gray-400 flex-1 truncate">{c.message}</span>
+                <button onClick={() => handleRevert(c.hash, c.message)}
+                  className="text-[11px] px-2 py-0.5 rounded text-gray-700 hover:text-red-400 hover:bg-red-950/30 transition-colors opacity-0 group-hover:opacity-100">
+                  ↩ revert
+                </button>
+              </div>
+            ))
+          }
+        </div>
+      )}
+
+      {/* ── Main content ── */}
+      <div className="flex flex-1 overflow-hidden">
+
+        {/* Preview pane */}
+        <div className="w-[46%] flex-shrink-0 border-r border-[#1e1e1e] flex flex-col bg-[#0c0c0c]">
+          <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1e1e1e] bg-[#0f0f0f]">
+            <span className="text-[11px] text-gray-600 font-mono">localhost:3000</span>
+            <div className="flex items-center gap-2">
+              {(appLogs.length > 0) && (
+                <button onClick={() => setShowLogs(v => !v)}
+                  className={`text-[11px] px-2 py-0.5 rounded transition-colors ${showLogs ? 'text-indigo-400 bg-indigo-950/50' : 'text-gray-600 hover:text-gray-300 hover:bg-[#1e1e1e]'}`}>
+                  {showLogs ? 'Hide logs' : 'Show logs'}
+                </button>
+              )}
+              <button onClick={refreshPreview}
+                className="text-[11px] text-gray-600 hover:text-gray-300 px-2 py-0.5 rounded hover:bg-[#1e1e1e] transition-colors">
+                ↺
+              </button>
+            </div>
+          </div>
+
+          {/* Log panel */}
+          {showLogs && (
+            <div className="h-48 border-b border-[#1e1e1e] bg-[#080808] overflow-y-auto p-2 font-mono text-[11px] flex-shrink-0">
+              {appLogs.length === 0
+                ? <span className="text-gray-700">Waiting for output…</span>
+                : appLogs.map((line, i) => {
+                    const isErr = line.includes('[stderr]') || line.toLowerCase().includes('error');
+                    const isWarn = line.toLowerCase().includes('warn');
+                    const isStudio = line.startsWith('[studio]');
+                    return (
+                      <div key={i} className={`leading-5 ${isErr ? 'text-red-400' : isWarn ? 'text-yellow-500' : isStudio ? 'text-indigo-400' : 'text-gray-400'}`}>
+                        {line}
+                      </div>
+                    );
+                  })
+              }
+              <div ref={logsEndRef} />
+            </div>
+          )}
+
+          <div className={`flex-1 overflow-auto flex min-h-0 ${viewMode === 'mobile' ? 'justify-center pt-6 pb-6' : ''}`}>
+            {appRunning ? (
+              viewMode === 'mobile' ? (
+                <div className="phone-frame">
+                  <iframe ref={iframeRef} src="http://localhost:3000" title="preview" />
+                </div>
+              ) : (
+                <iframe ref={iframeRef} src="http://localhost:3000" title="preview"
+                  className="w-full h-full border-none" />
+              )
+            ) : (
+              <div className="flex flex-col items-center justify-center h-full gap-3 text-center px-4">
+                {appStarting ? (
+                  <>
+                    <svg className="w-6 h-6 spin text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round"/>
+                    </svg>
+                    <div className="text-gray-500 text-sm">Starting Focus-app…</div>
+                    <div className="text-xs text-gray-700">Check the log panel above for output</div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-5xl text-gray-800">⬡</div>
+                    <div className="text-gray-600 text-sm">App is not running</div>
+                    {appLogs.length > 0 && (
+                      <div className="text-xs text-red-500 max-w-xs">
+                        Process exited — check logs above for the error
+                      </div>
+                    )}
+                    <button onClick={toggleApp}
+                      className="px-4 py-2 text-sm rounded-xl bg-indigo-600 hover:bg-indigo-500 transition-colors">
+                      Start Focus-app
+                    </button>
+                    <p className="text-xs text-gray-700">
+                      or run <code className="bg-[#1e1e1e] px-1.5 py-0.5 rounded font-mono">npm run dev</code> manually
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Agents area */}
+        <div className="flex-1 flex overflow-hidden">
+
+          {/* Agent sidebar */}
+          <div className="w-44 flex-shrink-0 border-r border-[#1e1e1e] flex flex-col bg-[#0d0d0d]">
+            <div className="px-3 py-2 border-b border-[#1e1e1e]">
+              <span className="text-[11px] text-gray-600 uppercase tracking-wider">Agents</span>
+            </div>
+            <div className="flex-1 overflow-y-auto py-1">
+              {agentList.map(agent => {
+                const isOpen = openAgents.has(agent.id);
+                return (
+                  <div key={agent.id}
+                    onClick={() => toggleAgent(agent.id)}
+                    className={`flex items-center gap-2 px-3 py-2 cursor-pointer transition-colors group ${isOpen ? 'bg-indigo-950/30 text-white' : 'text-gray-500 hover:text-gray-300 hover:bg-[#161616]'}`}>
+                    <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${isOpen ? 'bg-indigo-400' : 'bg-gray-700'}`} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-medium truncate">{agent.name}</div>
+                      <div className="text-[10px] text-gray-600 truncate font-mono">{agent.branch}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="p-2 border-t border-[#1e1e1e]">
+              <button onClick={() => setShowNewAgent(true)}
+                className="w-full py-1.5 text-xs rounded-lg border border-dashed border-[#2a2a2a] text-gray-600 hover:text-indigo-400 hover:border-indigo-800 transition-colors">
+                + New Agent
+              </button>
+            </div>
+          </div>
+
+          {/* Open agent panels */}
+          <div className="flex-1 overflow-x-auto overflow-y-hidden">
+            <div className="flex h-full gap-3 p-3" style={{ minWidth: 'max-content' }}>
+              {agentList.filter(a => openAgents.has(a.id)).map(agent => (
+                <AgentPanel key={agent.id} agent={agent}
+                  onDelete={handleDeleteAgent} onPush={handlePush}
+                  onClose={() => toggleAgent(agent.id)}
+                  onMerge={handleMergeToMain} />
+              ))}
+              {openAgents.size === 0 && (
+                <div className="flex items-center justify-center flex-1 text-gray-700 text-sm">
+                  Select an agent from the sidebar
+                </div>
+              )}
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      {/* ── Modals ── */}
+      {showNewAgent && <NewAgentModal onClose={() => setShowNewAgent(false)} onCreate={handleCreateAgent} />}
+      {showPR && <PRModal currentBranch={gitInfo.branch} onClose={() => setShowPR(false)} onCreate={handleCreatePR} />}
+
+      {/* ── Toast ── */}
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

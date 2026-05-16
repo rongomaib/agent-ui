@@ -1,0 +1,5 @@
+.env
+agents.json
+__pycache__/
+*.pyc
+*.pyo
