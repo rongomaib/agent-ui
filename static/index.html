@@ -45,6 +45,8 @@
 
     .spin { animation: spin 1s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
     textarea { field-sizing: content; min-height: 20px; max-height: 96px; }
   </style>
@@ -65,12 +67,36 @@ async function api(path, method = 'GET', body = null) {
   return r.json();
 }
 
-async function streamMessage(agentId, content, onEvent) {
+function compressImage(file) {
+  return new Promise(resolve => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const MAX = 1280;
+      let { width, height } = img;
+      if (width > MAX || height > MAX) {
+        if (width > height) { height = Math.round(height * MAX / width); width = MAX; }
+        else { width = Math.round(width * MAX / height); height = MAX; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width; canvas.height = height;
+      canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      resolve({ data: dataUrl.split(',')[1], mediaType: 'image/jpeg', preview: dataUrl });
+    };
+    img.src = url;
+  });
+}
+
+async function streamMessage(agentId, content, image, onEvent) {
   console.log(`[stream] → agent ${agentId}:`, content);
+  const body = { content };
+  if (image) { body.image_data = image.data; body.image_media_type = image.mediaType; }
   const r = await fetch(`/api/agents/${agentId}/message`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(body),
   });
   console.log(`[stream] response status:`, r.status);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -209,12 +235,13 @@ function PRModal({ currentBranch, onClose, onCreate }) {
 }
 
 // ─── Agent Panel ─────────────────────────────────────────────────────────────
-function AgentPanel({ agent, onDelete, onPush, onClose, onMerge }) {
+function AgentPanel({ agent, onDelete, onPush, onClose, onMerge, onRefresh }) {
   const [messages, setMessages] = useState(
     (agent.messages || []).map(m => ({ ...m, id: Math.random() }))
   );
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [pendingImage, setPendingImage] = useState(null);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -222,8 +249,8 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge }) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const addMsg = (role, content, type = 'text') =>
-    setMessages(p => [...p, { id: Math.random(), role, content, type, streaming: false }]);
+  const addMsg = (role, content, type = 'text', image = null) =>
+    setMessages(p => [...p, { id: Math.random(), role, content, type, streaming: false, image }]);
 
   const appendToLast = text =>
     setMessages(p => {
@@ -250,7 +277,7 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge }) {
     const sid = Math.random();
     setMessages(p => [...p, { id: sid, role: 'assistant', content: '', type: 'summary', streaming: true }]);
     try {
-      await streamMessage(agent.id, 'In one sentence, briefly summarize what you just did.', ev => {
+      await streamMessage(agent.id, 'In one sentence, briefly summarize what you just did.', null, ev => {
         if (ev.type === 'text') {
           setMessages(p => {
             const msgs = [...p];
@@ -274,15 +301,27 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge }) {
     }
   };
 
+  const handlePaste = async e => {
+    const items = Array.from(e.clipboardData?.items || []);
+    const imgItem = items.find(i => i.type.startsWith('image/'));
+    if (!imgItem) return;
+    e.preventDefault();
+    const file = imgItem.getAsFile();
+    const compressed = await compressImage(file);
+    setPendingImage(compressed);
+  };
+
   const send = async () => {
     const msg = input.trim();
-    if (!msg || busy) return;
+    if ((!msg && !pendingImage) || busy) return;
     setInput('');
+    const img = pendingImage;
+    setPendingImage(null);
     setBusy(true);
-    addMsg('user', msg);
+    addMsg('user', msg, 'text', img?.preview || null);
     console.log(`[agent:${agent.id}] sending:`, msg);
     try {
-      await streamMessage(agent.id, msg, ev => {
+      await streamMessage(agent.id, msg, img, ev => {
         if (ev.type === 'text') appendToLast(ev.text);
         else if (ev.type === 'tool_start') { console.log(`[agent:${agent.id}] tool start:`, ev.name); addMsg('tool', `Running ${ev.name}…`, 'tool_start'); }
         else if (ev.type === 'tool_result') { console.log(`[agent:${agent.id}] tool result:`, ev.name, ev.result?.slice(0, 100)); addMsg('tool', `${ev.name} → ${ev.result}`, 'tool_result'); }
@@ -296,6 +335,7 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge }) {
     } finally {
       console.log(`[agent:${agent.id}] busy cleared`);
       setBusy(false);
+      onRefresh?.();
     }
   };
 
@@ -330,8 +370,9 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge }) {
 
     if (msg.role === 'user') return (
       <div key={msg.id} className="flex justify-end mb-2 px-2">
-        <div className="max-w-[88%] px-3 py-2 bg-indigo-600 rounded-2xl rounded-tr-md text-sm">
-          {msg.content}
+        <div className="max-w-[88%] flex flex-col items-end gap-1">
+          {msg.image && <img src={msg.image} className="rounded-xl max-h-40 border border-indigo-400/30" />}
+          {msg.content && <div className="px-3 py-2 bg-indigo-600 rounded-2xl rounded-tr-md text-sm">{msg.content}</div>}
         </div>
       </div>
     );
@@ -391,11 +432,18 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge }) {
 
       {/* Input */}
       <div className="p-2 border-t border-[#1e1e1e]">
+        {pendingImage && (
+          <div className="relative inline-block mb-1.5 ml-1">
+            <img src={pendingImage.preview} className="h-16 rounded-lg border border-[#2a2a2a]" />
+            <button onClick={() => setPendingImage(null)}
+              className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-[#333] hover:bg-[#555] rounded-full text-[9px] flex items-center justify-center text-gray-300">✕</button>
+          </div>
+        )}
         <div className="flex items-end gap-2 bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 focus-within:border-indigo-600 transition-colors">
           <textarea ref={inputRef} rows={1}
             className="flex-1 bg-transparent text-sm resize-none focus:outline-none placeholder-gray-700"
-            placeholder={busy ? 'Working…' : 'Give a task…'}
-            value={input} onChange={e => setInput(e.target.value)} onKeyDown={onKey}
+            placeholder={busy ? 'Working…' : 'Give a task… (paste screenshot)'}
+            value={input} onChange={e => setInput(e.target.value)} onKeyDown={onKey} onPaste={handlePaste}
             disabled={busy}
           />
           <button onClick={send} disabled={!input.trim() || busy}
@@ -467,6 +515,7 @@ function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [commits, setCommits]     = useState([]);
   const [toast, setToast]         = useState(null);
+  const [pulling, setPulling]     = useState(false);
   const iframeRef = useRef(null);
   const logsEndRef = useRef(null);
   const logPollRef = useRef(null);
@@ -478,7 +527,8 @@ function App() {
     checkApp();
     loadAgents();
     const t = setInterval(refreshGit, 10000);
-    return () => clearInterval(t);
+    const t2 = setInterval(loadAgents, 3000);
+    return () => { clearInterval(t); clearInterval(t2); };
   }, []);
 
   useEffect(() => {
@@ -527,11 +577,20 @@ function App() {
   };
 
   const handlePull = async () => {
+    setPulling(true);
     try {
       const d = await api('/api/git/pull', 'POST');
-      notify(d.output || 'Up to date');
-      refreshGit();
+      if (!d.ok) {
+        notify(d.output, 'error');
+        try { const l = await api('/api/app/logs'); setAppLogs(l.logs || []); setShowLogs(true); } catch {}
+      } else {
+        const msg = d.output?.toLowerCase().includes('up to date') ? 'Already up to date' : (d.output || 'Pulled successfully');
+        notify(msg);
+        refreshGit();
+        refreshPreview();
+      }
     } catch (e) { notify(e.message, 'error'); }
+    finally { setPulling(false); }
   };
 
   const handlePush = async branch => {
@@ -679,9 +738,11 @@ function App() {
           {appRunning ? '● Running' : appStarting ? '◌ Starting…' : '▶ Start'}
         </button>
 
-        <button onClick={handlePull}
-          className="px-3 py-1.5 text-xs rounded-lg border border-[#2a2a2a] text-gray-400 hover:text-white hover:bg-[#1e1e1e] transition-colors">
-          ↓ Pull
+        <button onClick={handlePull} disabled={pulling}
+          className="px-3 py-1.5 text-xs rounded-lg border border-[#2a2a2a] text-gray-400 hover:text-white hover:bg-[#1e1e1e] disabled:opacity-40 transition-colors flex items-center gap-1.5">
+          {pulling
+            ? <><svg className="w-3 h-3 spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round"/></svg>Pulling…</>
+            : '↓ Pull'}
         </button>
 
         <button onClick={() => setShowPR(true)}
@@ -816,6 +877,12 @@ function App() {
                     <div className="flex-1 min-w-0">
                       <div className="text-xs font-medium truncate">{agent.name}</div>
                       <div className="text-[10px] text-gray-600 truncate font-mono">{agent.branch}</div>
+                      {agent.status && (
+                        <div className="flex items-center gap-1 mt-0.5">
+                          <span className="w-1 h-1 rounded-full bg-yellow-500 flex-shrink-0 pulse-dot" />
+                          <span className="text-[9px] text-yellow-500/70 truncate">{agent.status}</span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -836,7 +903,8 @@ function App() {
                 <AgentPanel key={agent.id} agent={agent}
                   onDelete={handleDeleteAgent} onPush={handlePush}
                   onClose={() => toggleAgent(agent.id)}
-                  onMerge={handleMergeToMain} />
+                  onMerge={handleMergeToMain}
+                  onRefresh={loadAgents} />
               ))}
               {openAgents.size === 0 && (
                 <div className="flex items-center justify-center flex-1 text-gray-700 text-sm">
