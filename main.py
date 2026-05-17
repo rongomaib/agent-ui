@@ -19,17 +19,13 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-REPO_PATH = Path(os.getenv("REPO_PATH", r"C:\Users\imdyi\OneDrive\Desktop\Claude\Focus-app"))
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "rongomaib/Focus-app")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-6")
-APP_PORT = int(os.getenv("APP_PORT", "3000"))
-
 # Locate the claude CLI — on Windows it may be a .cmd file
 _claude_bin = shutil.which("claude") or "claude"
 CLAUDE_CMD = ["cmd", "/c", _claude_bin] if _claude_bin.lower().endswith(".cmd") else [_claude_bin]
-app = FastAPI()
 
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-6")
+
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,8 +34,35 @@ app.add_middleware(
 )
 
 AGENTS_FILE = Path(__file__).parent / "agents.json"
+SETTINGS_FILE = Path(__file__).parent / "settings.json"
 app_process: Optional[subprocess.Popen] = None
 app_logs: deque = deque(maxlen=200)
+
+# --- Settings ---
+_DEFAULT_SETTINGS = {
+    "repo_path": os.getenv("REPO_PATH", ""),
+    "github_repo": os.getenv("GITHUB_REPO", ""),
+    "github_token": os.getenv("GITHUB_TOKEN", ""),
+    "start_command": os.getenv("START_COMMAND", "npm run dev"),
+    "app_port": int(os.getenv("APP_PORT", "3000")),
+}
+
+
+def _load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            return {**_DEFAULT_SETTINGS, **data}
+        except Exception:
+            pass
+    return dict(_DEFAULT_SETTINGS)
+
+
+def _save_settings_file(s: dict):
+    SETTINGS_FILE.write_text(json.dumps(s, indent=2), encoding="utf-8")
+
+
+_settings: dict = _load_settings()
 
 
 def _pipe_reader(stream, label: str):
@@ -75,10 +98,14 @@ def _load_agents() -> dict:
 
 agents: dict = _load_agents()
 
+
 def run_git(args: list[str]) -> tuple[str, str]:
+    repo = _settings.get("repo_path", "")
+    if not repo:
+        return "", "No repo path configured"
     result = subprocess.run(
         ["git"] + args,
-        cwd=str(REPO_PATH),
+        cwd=repo,
         capture_output=True,
         text=True,
         timeout=30,
@@ -129,6 +156,38 @@ class PRRequest(BaseModel):
     base: str = "main"
 
 
+class SettingsRequest(BaseModel):
+    repo_path: str
+    github_repo: str
+    github_token: str
+    start_command: str
+    app_port: int
+
+
+# --- Settings routes ---
+@app.get("/api/settings")
+def get_settings_api():
+    return dict(_settings)
+
+
+@app.post("/api/settings")
+async def save_settings_api(req: SettingsRequest):
+    global _settings, app_process
+    _settings.update({
+        "repo_path": req.repo_path,
+        "github_repo": req.github_repo,
+        "github_token": req.github_token,
+        "start_command": req.start_command,
+        "app_port": req.app_port,
+    })
+    _save_settings_file(_settings)
+    # Stop running app — path/port/command may have changed
+    if app_process and app_process.poll() is None:
+        app_process.terminate()
+        app_process = None
+    return {"ok": True}
+
+
 # --- Git routes ---
 @app.get("/api/git/status")
 def git_status():
@@ -151,10 +210,13 @@ def git_branches():
 
 @app.post("/api/git/pull")
 def git_pull():
+    repo = _settings.get("repo_path", "")
+    if not repo:
+        return {"ok": False, "output": "No repo path configured — open Settings first"}
     branch, _ = run_git(["branch", "--show-current"])
     result = subprocess.run(
         ["git", "pull", "origin", branch],
-        cwd=str(REPO_PATH),
+        cwd=repo,
         capture_output=True, text=True, timeout=30,
         encoding="utf-8", errors="replace",
     )
@@ -225,11 +287,13 @@ def git_revert(req: RevertRequest):
 # --- GitHub PR ---
 @app.post("/api/github/pr")
 async def create_pr(req: PRRequest):
+    github_repo = _settings.get("github_repo", "")
+    github_token = _settings.get("github_token", "")
     async with httpx.AsyncClient() as hclient:
         resp = await hclient.post(
-            f"https://api.github.com/repos/{GITHUB_REPO}/pulls",
+            f"https://api.github.com/repos/{github_repo}/pulls",
             headers={
-                "Authorization": f"token {GITHUB_TOKEN}",
+                "Authorization": f"token {github_token}",
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
@@ -249,16 +313,21 @@ async def start_app():
     if app_process and app_process.poll() is None:
         return {"status": "already_running", "pid": app_process.pid}
 
-    app_logs.clear()
-    app_logs.append(f"[studio] Working directory: {REPO_PATH}")
+    repo = _settings.get("repo_path", "")
+    start_cmd = _settings.get("start_command", "npm run dev")
 
-    # Auto-install node_modules if missing
-    if not (REPO_PATH / "node_modules").exists():
+    if not repo:
+        return {"status": "error", "error": "No repo path configured — open Settings first"}
+
+    app_logs.clear()
+    app_logs.append(f"[studio] Working directory: {repo}")
+
+    if "npm" in start_cmd and not (Path(repo) / "node_modules").exists():
         app_logs.append("[studio] node_modules not found — running npm install first…")
         try:
             install = subprocess.Popen(
                 "npm install",
-                cwd=str(REPO_PATH),
+                cwd=repo,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=True,
@@ -274,19 +343,19 @@ async def start_app():
             app_logs.append("[studio] ERROR: 'npm' not found — is Node.js installed and on PATH?")
             return {"status": "error", "error": "npm not found"}
     else:
-        app_logs.append("[studio] Starting Focus-app with: npm run dev")
+        app_logs.append(f"[studio] Starting with: {start_cmd}")
 
     try:
         app_process = subprocess.Popen(
-            "npm run dev",
-            cwd=str(REPO_PATH),
+            start_cmd,
+            cwd=repo,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=True,
         )
-    except FileNotFoundError:
-        app_logs.append("[studio] ERROR: 'npm' not found — is Node.js installed and on PATH?")
-        return {"status": "error", "error": "npm not found"}
+    except FileNotFoundError as e:
+        app_logs.append(f"[studio] ERROR: command not found — {e}")
+        return {"status": "error", "error": str(e)}
 
     threading.Thread(target=_pipe_reader, args=(app_process.stdout, "stdout"), daemon=True).start()
     threading.Thread(target=_pipe_reader, args=(app_process.stderr, "stderr"), daemon=True).start()
@@ -312,7 +381,7 @@ def app_status():
     exit_code = None
     if app_process and app_process.poll() is not None:
         exit_code = app_process.poll()
-    return {"running": running, "pid": app_process.pid if running else None, "port": APP_PORT, "exit_code": exit_code}
+    return {"running": running, "pid": app_process.pid if running else None, "port": _settings.get("app_port", 3000), "exit_code": exit_code}
 
 
 @app.get("/api/app/logs")
@@ -378,7 +447,6 @@ async def send_message(agent_id: str, req: MessageRequest):
         agent["status"] = (req.content or "[image]")[:100]
         _save_agents(agents)
 
-        # Build prompt — include other agents' status so Claude Code is aware
         other_active = [a for aid, a in agents.items() if aid != agent_id and a.get("status")]
         prompt = req.content or "Describe what you see in this image."
         if other_active:
@@ -395,8 +463,9 @@ async def send_message(agent_id: str, req: MessageRequest):
         if agent.get("session_id"):
             cmd += ["--resume", agent["session_id"]]
         else:
+            repo_name = Path(_settings.get("repo_path", "")).name or "the project"
             system = (
-                f"You are a coding assistant working on the Focus-app project. "
+                f"You are a coding assistant working on the {repo_name} project. "
                 f"You are on git branch '{agent['branch']}'. "
                 f"Match the existing code style. Think step by step before making changes."
             )
@@ -405,10 +474,12 @@ async def send_message(agent_id: str, req: MessageRequest):
         if agent.get("model"):
             cmd += ["--model", agent["model"]]
 
+        repo = _settings.get("repo_path", "") or str(Path.cwd())
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                cwd=str(REPO_PATH),
+                cwd=repo,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
