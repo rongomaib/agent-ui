@@ -1,0 +1,7 @@
+{
+  "repo_path": "/path/to/your/project",
+  "github_repo": "owner/repo",
+  "github_token": "",
+  "start_command": "npm run dev",
+  "app_port": 3000
+}

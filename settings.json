@@ -1,7 +1,0 @@
-{
-  "repo_path": "C:\\Users\\imdyi\\OneDrive\\Desktop\\Claude\\Focus-app",
-  "github_repo": "rongomaib/Focus-app",
-  "github_token": "",
-  "start_command": "npm run dev",
-  "app_port": 3000
-}

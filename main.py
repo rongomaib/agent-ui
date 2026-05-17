@@ -167,16 +167,20 @@ class SettingsRequest(BaseModel):
 # --- Settings routes ---
 @app.get("/api/settings")
 def get_settings_api():
-    return dict(_settings)
+    s = dict(_settings)
+    if s.get("github_token"):
+        s["github_token"] = "********"
+    return s
 
 
 @app.post("/api/settings")
 async def save_settings_api(req: SettingsRequest):
     global _settings, app_process
+    token = req.github_token if req.github_token != "********" else _settings.get("github_token", "")
     _settings.update({
         "repo_path": req.repo_path,
         "github_repo": req.github_repo,
-        "github_token": req.github_token,
+        "github_token": token,
         "start_command": req.start_command,
         "app_port": req.app_port,
     })
@@ -552,4 +556,4 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
