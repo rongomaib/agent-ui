@@ -38,24 +38,31 @@ SETTINGS_FILE = Path(__file__).parent / "settings.json"
 app_process: Optional[subprocess.Popen] = None
 app_logs: deque = deque(maxlen=200)
 
-# --- Settings ---
-_DEFAULT_SETTINGS = {
-    "repo_path": os.getenv("REPO_PATH", ""),
-    "github_repo": os.getenv("GITHUB_REPO", ""),
-    "github_token": os.getenv("GITHUB_TOKEN", ""),
-    "start_command": os.getenv("START_COMMAND", "npm run dev"),
-    "app_port": int(os.getenv("APP_PORT", "3000")),
-}
+# --- Settings (multi-repo) ---
+
+def _default_repo() -> dict:
+    return {
+        "name": "",
+        "repo_path": os.getenv("REPO_PATH", ""),
+        "github_repo": os.getenv("GITHUB_REPO", ""),
+        "github_token": os.getenv("GITHUB_TOKEN", ""),
+        "start_command": os.getenv("START_COMMAND", "npm run dev"),
+        "app_port": int(os.getenv("APP_PORT", "3000")),
+    }
 
 
 def _load_settings() -> dict:
     if SETTINGS_FILE.exists():
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            return {**_DEFAULT_SETTINGS, **data}
+            # Migrate old flat format → multi-repo
+            if "repos" not in data:
+                name = Path(data.get("repo_path", "")).name or "Project"
+                return {"active": 0, "repos": [{**data, "name": name}]}
+            return data
         except Exception:
             pass
-    return dict(_DEFAULT_SETTINGS)
+    return {"active": 0, "repos": [_default_repo()]}
 
 
 def _save_settings_file(s: dict):
@@ -63,6 +70,21 @@ def _save_settings_file(s: dict):
 
 
 _settings: dict = _load_settings()
+
+
+def _active_repo() -> dict:
+    repos = _settings.get("repos", [])
+    if not repos:
+        return {}
+    idx = max(0, min(_settings.get("active", 0), len(repos) - 1))
+    return repos[idx]
+
+
+def _mask_token(repo: dict) -> dict:
+    r = dict(repo)
+    if r.get("github_token"):
+        r["github_token"] = "********"
+    return r
 
 
 def _pipe_reader(stream, label: str):
@@ -100,7 +122,7 @@ agents: dict = _load_agents()
 
 
 def run_git(args: list[str]) -> tuple[str, str]:
-    repo = _settings.get("repo_path", "")
+    repo = _active_repo().get("repo_path", "")
     if not repo:
         return "", "No repo path configured"
     result = subprocess.run(
@@ -156,40 +178,144 @@ class PRRequest(BaseModel):
     base: str = "main"
 
 
-class SettingsRequest(BaseModel):
-    repo_path: str
-    github_repo: str
-    github_token: str
-    start_command: str
-    app_port: int
+class RepoConfig(BaseModel):
+    name: str = ""
+    repo_path: str = ""
+    github_repo: str = ""
+    github_token: str = ""
+    start_command: str = "npm run dev"
+    app_port: int = 3000
 
 
-# --- Settings routes ---
+# --- Settings / Repos routes ---
+
 @app.get("/api/settings")
 def get_settings_api():
-    s = dict(_settings)
-    if s.get("github_token"):
-        s["github_token"] = "********"
-    return s
+    """Returns the active repo config (masked). Kept for backward compat."""
+    return _mask_token(_active_repo())
 
 
 @app.post("/api/settings")
-async def save_settings_api(req: SettingsRequest):
-    global _settings, app_process
-    token = req.github_token if req.github_token != "********" else _settings.get("github_token", "")
-    _settings.update({
+async def save_settings_api(req: RepoConfig):
+    """Backward-compat: updates the active repo's settings."""
+    global app_process
+    repos = _settings.setdefault("repos", [_default_repo()])
+    idx = max(0, min(_settings.get("active", 0), len(repos) - 1))
+    token = req.github_token if req.github_token != "********" else repos[idx].get("github_token", "")
+    repos[idx] = {
+        "name": req.name or Path(req.repo_path).name,
         "repo_path": req.repo_path,
         "github_repo": req.github_repo,
         "github_token": token,
         "start_command": req.start_command,
         "app_port": req.app_port,
-    })
+    }
     _save_settings_file(_settings)
-    # Stop running app — path/port/command may have changed
     if app_process and app_process.poll() is None:
         app_process.terminate()
         app_process = None
     return {"ok": True}
+
+
+@app.get("/api/repos")
+def list_repos():
+    repos = _settings.get("repos", [])
+    return {"repos": [_mask_token(r) for r in repos], "active": _settings.get("active", 0)}
+
+
+@app.post("/api/repos")
+async def add_repo(req: RepoConfig):
+    repos = _settings.setdefault("repos", [])
+    repos.append({
+        "name": req.name or Path(req.repo_path).name or "Project",
+        "repo_path": req.repo_path,
+        "github_repo": req.github_repo,
+        "github_token": req.github_token,
+        "start_command": req.start_command,
+        "app_port": req.app_port,
+    })
+    _save_settings_file(_settings)
+    return {"ok": True, "index": len(repos) - 1}
+
+
+@app.put("/api/repos/{index}")
+async def update_repo(index: int, req: RepoConfig):
+    global app_process
+    repos = _settings.get("repos", [])
+    if index < 0 or index >= len(repos):
+        raise HTTPException(404, "Repo not found")
+    token = req.github_token if req.github_token != "********" else repos[index].get("github_token", "")
+    repos[index] = {
+        "name": req.name or Path(req.repo_path).name,
+        "repo_path": req.repo_path,
+        "github_repo": req.github_repo,
+        "github_token": token,
+        "start_command": req.start_command,
+        "app_port": req.app_port,
+    }
+    _save_settings_file(_settings)
+    if _settings.get("active") == index and app_process and app_process.poll() is None:
+        app_process.terminate()
+        app_process = None
+    return {"ok": True}
+
+
+@app.delete("/api/repos/{index}")
+async def delete_repo(index: int):
+    global app_process
+    repos = _settings.get("repos", [])
+    if index < 0 or index >= len(repos):
+        raise HTTPException(404, "Repo not found")
+    if len(repos) == 1:
+        raise HTTPException(400, "Cannot delete the only repo")
+    repos.pop(index)
+    active = _settings.get("active", 0)
+    if active >= len(repos):
+        _settings["active"] = len(repos) - 1
+    elif active > index:
+        _settings["active"] = active - 1
+    _save_settings_file(_settings)
+    if app_process and app_process.poll() is None:
+        app_process.terminate()
+        app_process = None
+    return {"ok": True}
+
+
+@app.post("/api/repos/{index}/activate")
+async def activate_repo(index: int):
+    global app_process
+    repos = _settings.get("repos", [])
+    if index < 0 or index >= len(repos):
+        raise HTTPException(404, "Repo not found")
+    _settings["active"] = index
+    _save_settings_file(_settings)
+    if app_process and app_process.poll() is None:
+        app_process.terminate()
+        app_process = None
+    return {"ok": True}
+
+
+@app.get("/api/github/repos")
+async def list_github_repos(search: str = ""):
+    token = _active_repo().get("github_token", "")
+    if not token:
+        raise HTTPException(400, "No GitHub token configured in active repo")
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.github.com/user/repos",
+            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+            params={"per_page": 100, "sort": "updated"},
+            timeout=10,
+        )
+    data = resp.json()
+    if not isinstance(data, list):
+        raise HTTPException(400, data.get("message", "GitHub API error"))
+    if search:
+        data = [r for r in data if search.lower() in r.get("full_name", "").lower()]
+    return [
+        {"full_name": r["full_name"], "private": r.get("private", False), "description": r.get("description") or ""}
+        for r in data
+    ]
 
 
 # --- Git routes ---
@@ -214,7 +340,7 @@ def git_branches():
 
 @app.post("/api/git/pull")
 def git_pull():
-    repo = _settings.get("repo_path", "")
+    repo = _active_repo().get("repo_path", "")
     if not repo:
         return {"ok": False, "output": "No repo path configured — open Settings first"}
     branch, _ = run_git(["branch", "--show-current"])
@@ -291,8 +417,8 @@ def git_revert(req: RevertRequest):
 # --- GitHub PR ---
 @app.post("/api/github/pr")
 async def create_pr(req: PRRequest):
-    github_repo = _settings.get("github_repo", "")
-    github_token = _settings.get("github_token", "")
+    github_repo = _active_repo().get("github_repo", "")
+    github_token = _active_repo().get("github_token", "")
     async with httpx.AsyncClient() as hclient:
         resp = await hclient.post(
             f"https://api.github.com/repos/{github_repo}/pulls",
@@ -317,8 +443,8 @@ async def start_app():
     if app_process and app_process.poll() is None:
         return {"status": "already_running", "pid": app_process.pid}
 
-    repo = _settings.get("repo_path", "")
-    start_cmd = _settings.get("start_command", "npm run dev")
+    repo = _active_repo().get("repo_path", "")
+    start_cmd = _active_repo().get("start_command", "npm run dev")
 
     if not repo:
         return {"status": "error", "error": "No repo path configured — open Settings first"}
@@ -385,7 +511,7 @@ def app_status():
     exit_code = None
     if app_process and app_process.poll() is not None:
         exit_code = app_process.poll()
-    return {"running": running, "pid": app_process.pid if running else None, "port": _settings.get("app_port", 3000), "exit_code": exit_code}
+    return {"running": running, "pid": app_process.pid if running else None, "port": _active_repo().get("app_port", 3000), "exit_code": exit_code}
 
 
 @app.get("/api/app/logs")
@@ -438,6 +564,31 @@ def delete_agent(agent_id: str):
     return {"ok": True}
 
 
+@app.post("/api/agents/{agent_id}/undo")
+def undo_agent_changes(agent_id: str):
+    if agent_id not in agents:
+        raise HTTPException(404, "Agent not found")
+    branch = agents[agent_id]["branch"]
+    run_git(["checkout", branch])
+    out, err = run_git(["restore", "."])
+    ok = not (err and "error" in err.lower())
+    return {"ok": ok, "output": out or err or "Changes discarded"}
+
+
+@app.get("/api/agents/{agent_id}/log")
+def agent_log(agent_id: str):
+    if agent_id not in agents:
+        raise HTTPException(404, "Agent not found")
+    branch = agents[agent_id]["branch"]
+    stdout, _ = run_git(["log", branch, "--oneline", "-8"])
+    commits = []
+    for line in stdout.splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            commits.append({"hash": parts[0], "message": parts[1]})
+    return {"commits": commits}
+
+
 @app.post("/api/agents/{agent_id}/message")
 async def send_message(agent_id: str, req: MessageRequest):
     if agent_id not in agents:
@@ -467,7 +618,7 @@ async def send_message(agent_id: str, req: MessageRequest):
         if agent.get("session_id"):
             cmd += ["--resume", agent["session_id"]]
         else:
-            repo_name = Path(_settings.get("repo_path", "")).name or "the project"
+            repo_name = Path(_active_repo().get("repo_path", "")).name or "the project"
             system = (
                 f"You are a coding assistant working on the {repo_name} project. "
                 f"You are on git branch '{agent['branch']}'. "
@@ -478,7 +629,7 @@ async def send_message(agent_id: str, req: MessageRequest):
         if agent.get("model"):
             cmd += ["--model", agent["model"]]
 
-        repo = _settings.get("repo_path", "") or str(Path.cwd())
+        repo = _active_repo().get("repo_path", "") or str(Path.cwd())
 
         try:
             proc = await asyncio.create_subprocess_exec(

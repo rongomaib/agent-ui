@@ -95,7 +95,6 @@ function compressImage(file) {
 }
 
 async function streamMessage(agentId, content, image, onEvent) {
-  console.log(`[stream] → agent ${agentId}:`, content);
   const body = { content };
   if (image) { body.image_data = image.data; body.image_media_type = image.mediaType; }
   const r = await fetch(`/api/agents/${agentId}/message`, {
@@ -103,33 +102,25 @@ async function streamMessage(agentId, content, image, onEvent) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  console.log(`[stream] response status:`, r.status);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const reader = r.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
   while (true) {
     const { done, value } = await reader.read();
-    if (done) { console.log(`[stream] reader done`); break; }
+    if (done) break;
     buf += dec.decode(value, { stream: true });
     const lines = buf.split('\n');
     buf = lines.pop();
     for (const line of lines) {
       if (line.startsWith('data: ')) {
-        try {
-          const ev = JSON.parse(line.slice(6));
-          console.log(`[stream] event:`, ev);
-          onEvent(ev);
-        } catch (e) {
-          console.warn(`[stream] parse error on line:`, line, e);
-        }
+        try { onEvent(JSON.parse(line.slice(6))); } catch {}
       }
     }
   }
-  console.log(`[stream] finished`);
 }
 
-// ─── Toast ──────────────────────────────────────────────────────────────────
+// ─── Toast ───────────────────────────────────────────────────────────────────
 function Toast({ message, type, onClose }) {
   useEffect(() => { const t = setTimeout(onClose, 4000); return () => clearTimeout(t); }, []);
   return (
@@ -142,18 +133,87 @@ function Toast({ message, type, onClose }) {
   );
 }
 
-// ─── Settings Modal ──────────────────────────────────────────────────────────
-function SettingsModal({ settings, onClose, onSave }) {
-  const [form, setForm] = useState({ ...settings });
+// ─── Shared repo form fields ──────────────────────────────────────────────────
+function RepoFormFields({ form, setForm }) {
   const [showToken, setShowToken] = useState(false);
-  const [saving, setSaving] = useState(false);
   const set = (key, val) => setForm(f => ({ ...f, [key]: val }));
+  return (
+    <>
+      <label className="block text-xs text-gray-500 mb-1">Repo name <span className="text-gray-700">(optional)</span></label>
+      <input
+        className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm mb-4 focus:outline-none focus:border-indigo-500 transition-colors"
+        placeholder="My App"
+        value={form.name || ''}
+        onChange={e => set('name', e.target.value)}
+      />
+
+      <label className="block text-xs text-gray-500 mb-1">Repo path</label>
+      <input
+        className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-xs mb-4 focus:outline-none focus:border-indigo-500 font-mono transition-colors"
+        placeholder="C:\Users\you\projects\my-app  or  /home/you/my-app"
+        value={form.repo_path || ''}
+        onChange={e => set('repo_path', e.target.value)}
+      />
+
+      <label className="block text-xs text-gray-500 mb-1">GitHub repo</label>
+      <input
+        className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm mb-4 focus:outline-none focus:border-indigo-500 transition-colors"
+        placeholder="owner/repo"
+        value={form.github_repo || ''}
+        onChange={e => set('github_repo', e.target.value)}
+      />
+
+      <label className="block text-xs text-gray-500 mb-1">GitHub token</label>
+      <div className="relative mb-4">
+        <input
+          type={showToken ? 'text' : 'password'}
+          className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 pr-14 text-sm focus:outline-none focus:border-indigo-500 font-mono transition-colors"
+          placeholder="ghp_…"
+          value={form.github_token || ''}
+          onChange={e => set('github_token', e.target.value)}
+        />
+        <button onClick={() => setShowToken(v => !v)}
+          className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] text-gray-600 hover:text-gray-300 transition-colors">
+          {showToken ? 'hide' : 'show'}
+        </button>
+      </div>
+
+      <div className="flex gap-3 mb-6">
+        <div className="flex-1">
+          <label className="block text-xs text-gray-500 mb-1">Start command</label>
+          <input
+            className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-indigo-500 font-mono transition-colors"
+            placeholder="npm run dev"
+            value={form.start_command || ''}
+            onChange={e => set('start_command', e.target.value)}
+          />
+        </div>
+        <div className="w-28">
+          <label className="block text-xs text-gray-500 mb-1">Preview port</label>
+          <input
+            type="number"
+            className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 transition-colors"
+            placeholder="3000"
+            value={form.app_port || 3000}
+            onChange={e => set('app_port', e.target.value)}
+          />
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── Settings Modal ───────────────────────────────────────────────────────────
+function SettingsModal({ settings, onClose, onSave }) {
+  const activeRepo = settings.repos?.[settings.active] || {};
+  const [form, setForm] = useState({ ...activeRepo });
+  const [saving, setSaving] = useState(false);
 
   const save = async () => {
     setSaving(true);
     try {
-      await api('/api/settings', 'POST', { ...form, app_port: Number(form.app_port) || 3000 });
-      onSave({ ...form, app_port: Number(form.app_port) || 3000 });
+      await api(`/api/repos/${settings.active}`, 'PUT', { ...form, app_port: Number(form.app_port) || 3000 });
+      await onSave();
       onClose();
     } catch (e) {
       alert(`Failed to save: ${e.message}`);
@@ -162,66 +222,12 @@ function SettingsModal({ settings, onClose, onSave }) {
     }
   };
 
-  const onKey = e => { if (e.key === 'Escape') onClose(); };
-
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70" onClick={onClose} onKeyDown={onKey}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70"
+      onClick={onClose} onKeyDown={e => e.key === 'Escape' && onClose()}>
       <div className="bg-[#141414] border border-[#2a2a2a] rounded-2xl p-6 w-[500px] shadow-2xl" onClick={e => e.stopPropagation()}>
         <h2 className="text-base font-semibold mb-5">Settings</h2>
-
-        <label className="block text-xs text-gray-500 mb-1">Repo path</label>
-        <input autoFocus
-          className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-xs mb-4 focus:outline-none focus:border-indigo-500 font-mono transition-colors"
-          placeholder="C:\Users\you\projects\my-app  or  /home/you/my-app"
-          value={form.repo_path}
-          onChange={e => set('repo_path', e.target.value)}
-        />
-
-        <label className="block text-xs text-gray-500 mb-1">GitHub repo</label>
-        <input
-          className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm mb-4 focus:outline-none focus:border-indigo-500 transition-colors"
-          placeholder="owner/repo"
-          value={form.github_repo}
-          onChange={e => set('github_repo', e.target.value)}
-        />
-
-        <label className="block text-xs text-gray-500 mb-1">GitHub token</label>
-        <div className="relative mb-4">
-          <input
-            type={showToken ? 'text' : 'password'}
-            className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 pr-14 text-sm focus:outline-none focus:border-indigo-500 font-mono transition-colors"
-            placeholder="ghp_…"
-            value={form.github_token}
-            onChange={e => set('github_token', e.target.value)}
-          />
-          <button onClick={() => setShowToken(v => !v)}
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] text-gray-600 hover:text-gray-300 transition-colors">
-            {showToken ? 'hide' : 'show'}
-          </button>
-        </div>
-
-        <div className="flex gap-3 mb-6">
-          <div className="flex-1">
-            <label className="block text-xs text-gray-500 mb-1">Start command</label>
-            <input
-              className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-indigo-500 font-mono transition-colors"
-              placeholder="npm run dev"
-              value={form.start_command}
-              onChange={e => set('start_command', e.target.value)}
-            />
-          </div>
-          <div className="w-28">
-            <label className="block text-xs text-gray-500 mb-1">Preview port</label>
-            <input
-              type="number"
-              className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 transition-colors"
-              placeholder="3000"
-              value={form.app_port}
-              onChange={e => set('app_port', e.target.value)}
-            />
-          </div>
-        </div>
-
+        <RepoFormFields form={form} setForm={setForm} />
         <div className="flex gap-2 justify-end">
           <button onClick={onClose} className="px-4 py-2 text-sm rounded-xl bg-[#1e1e1e] hover:bg-[#2a2a2a] transition-colors">Cancel</button>
           <button onClick={save} disabled={saving || !form.repo_path}
@@ -234,7 +240,160 @@ function SettingsModal({ settings, onClose, onSave }) {
   );
 }
 
-// ─── New Agent Modal ─────────────────────────────────────────────────────────
+// ─── GitHub Repo Browser ──────────────────────────────────────────────────────
+function GitHubRepoBrowser({ onSelect, onClose }) {
+  const [repos, setRepos] = useState([]);
+  const [search, setSearch] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    api('/api/github/repos')
+      .then(r => { setRepos(Array.isArray(r) ? r : []); setLoading(false); })
+      .catch(e => { setError(e.message); setLoading(false); });
+  }, []);
+
+  const filtered = repos.filter(r => !search || r.full_name.toLowerCase().includes(search.toLowerCase()));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80" onClick={onClose}>
+      <div className="bg-[#141414] border border-[#2a2a2a] rounded-2xl w-[480px] shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 pt-5 pb-3 border-b border-[#2a2a2a]">
+          <h3 className="text-sm font-semibold">Select GitHub repo</h3>
+          <button onClick={onClose} className="text-gray-600 hover:text-gray-300 transition-colors">✕</button>
+        </div>
+        <div className="p-3">
+          <input autoFocus
+            className="w-full bg-[#0d0d0d] border border-[#2a2a2a] rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 transition-colors"
+            placeholder="Search repos…"
+            value={search} onChange={e => setSearch(e.target.value)}
+          />
+        </div>
+        <div className="max-h-72 overflow-y-auto pb-2">
+          {loading ? (
+            <div className="px-5 py-4 text-xs text-gray-600">Loading…</div>
+          ) : error ? (
+            <div className="px-5 py-4 text-xs text-red-400">{error}</div>
+          ) : filtered.length === 0 ? (
+            <div className="px-5 py-4 text-xs text-gray-600">No repos found</div>
+          ) : filtered.map(r => (
+            <button key={r.full_name} onClick={() => onSelect(r.full_name)}
+              className="w-full text-left px-5 py-2.5 hover:bg-[#1e1e1e] transition-colors flex items-start gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="text-sm text-gray-200 font-medium truncate">{r.full_name}</div>
+                {r.description && <div className="text-xs text-gray-600 truncate mt-0.5">{r.description}</div>}
+              </div>
+              {r.private && <span className="text-[10px] px-1.5 py-0.5 bg-yellow-950 text-yellow-600 rounded flex-shrink-0 mt-0.5">private</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Add Repo Modal ───────────────────────────────────────────────────────────
+function AddRepoModal({ onClose, onSave, hasToken }) {
+  const [form, setForm] = useState({ name: '', repo_path: '', github_repo: '', github_token: '', start_command: 'npm run dev', app_port: 3000 });
+  const [saving, setSaving] = useState(false);
+  const [showGitHub, setShowGitHub] = useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await onSave({ ...form, app_port: Number(form.app_port) || 3000 });
+    } catch (e) {
+      alert(`Failed to add repo: ${e.message}`);
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70" onClick={onClose}>
+        <div className="bg-[#141414] border border-[#2a2a2a] rounded-2xl p-6 w-[500px] shadow-2xl" onClick={e => e.stopPropagation()}>
+          <div className="flex items-center justify-between mb-5">
+            <h2 className="text-base font-semibold">Add Repo</h2>
+            {hasToken && (
+              <button onClick={() => setShowGitHub(true)}
+                className="text-xs px-3 py-1.5 rounded-lg border border-[#2a2a2a] text-gray-500 hover:text-indigo-400 hover:border-indigo-800 transition-colors flex items-center gap-1.5">
+                <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+                </svg>
+                Browse GitHub
+              </button>
+            )}
+          </div>
+          <RepoFormFields form={form} setForm={setForm} />
+          <div className="flex gap-2 justify-end">
+            <button onClick={onClose} className="px-4 py-2 text-sm rounded-xl bg-[#1e1e1e] hover:bg-[#2a2a2a] transition-colors">Cancel</button>
+            <button onClick={save} disabled={saving || !form.repo_path}
+              className="px-4 py-2 text-sm rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 transition-colors">
+              {saving ? 'Adding…' : 'Add Repo'}
+            </button>
+          </div>
+        </div>
+      </div>
+      {showGitHub && (
+        <GitHubRepoBrowser
+          onSelect={full_name => { setForm(f => ({ ...f, github_repo: full_name })); setShowGitHub(false); }}
+          onClose={() => setShowGitHub(false)}
+        />
+      )}
+    </>
+  );
+}
+
+// ─── Repo Switcher ────────────────────────────────────────────────────────────
+function RepoSwitcher({ repos, active, onSwitch, onAdd }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const handler = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const pathName = p => p?.replace(/\\/g, '/').split('/').filter(Boolean).pop();
+  const current = repos[active];
+  const displayName = current?.name || pathName(current?.repo_path) || '—';
+
+  return (
+    <div ref={ref} className="relative">
+      <button onClick={() => setOpen(v => !v)}
+        className="flex items-center gap-1 text-gray-400 text-sm hover:text-white transition-colors">
+        {displayName}
+        <span className="text-gray-600 text-[10px] ml-0.5">▾</span>
+      </button>
+      {open && (
+        <div className="absolute top-full left-0 mt-1 z-50 bg-[#161616] border border-[#2a2a2a] rounded-xl shadow-2xl w-64 py-1">
+          {repos.map((r, i) => {
+            const name = r.name || pathName(r.repo_path) || 'Unnamed';
+            return (
+              <button key={i} onClick={() => { onSwitch(i); setOpen(false); }}
+                className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2 transition-colors ${i === active ? 'text-indigo-400 bg-indigo-950/30' : 'text-gray-400 hover:text-white hover:bg-[#222]'}`}>
+                <span className="flex-1 truncate font-medium">{name}</span>
+                {r.repo_path && i !== active && (
+                  <span className="text-gray-700 text-[10px] truncate font-mono max-w-[120px]">{pathName(r.repo_path)}</span>
+                )}
+                {i === active && <span className="text-indigo-400 text-[10px] flex-shrink-0">✓</span>}
+              </button>
+            );
+          })}
+          <div className="border-t border-[#2a2a2a] mt-1 pt-1">
+            <button onClick={() => { onAdd(); setOpen(false); }}
+              className="w-full text-left px-3 py-2 text-xs text-gray-500 hover:text-indigo-400 hover:bg-[#222] transition-colors flex items-center gap-2">
+              <span>+</span> Add repo
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── New Agent Modal ──────────────────────────────────────────────────────────
 const MODELS = [
   { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 — fast, low cost' },
   { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6 — balanced' },
@@ -288,7 +447,7 @@ function NewAgentModal({ onClose, onCreate }) {
   );
 }
 
-// ─── PR Modal ────────────────────────────────────────────────────────────────
+// ─── PR Modal ─────────────────────────────────────────────────────────────────
 function PRModal({ currentBranch, onClose, onCreate }) {
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
@@ -331,14 +490,16 @@ function PRModal({ currentBranch, onClose, onCreate }) {
   );
 }
 
-// ─── Agent Panel ─────────────────────────────────────────────────────────────
-function AgentPanel({ agent, onDelete, onPush, onClose, onMerge, onRefresh }) {
+// ─── Agent Panel ──────────────────────────────────────────────────────────────
+function AgentPanel({ agent, onDelete, onPush, onClose, onMerge, onRefresh, notify }) {
   const [messages, setMessages] = useState(
     (agent.messages || []).map(m => ({ ...m, id: Math.random() }))
   );
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [pendingImage, setPendingImage] = useState(null);
+  const [showLog, setShowLog] = useState(false);
+  const [agentCommits, setAgentCommits] = useState([]);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -416,24 +577,46 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge, onRefresh }) {
     setPendingImage(null);
     setBusy(true);
     addMsg('user', msg, 'text', img?.preview || null);
-    console.log(`[agent:${agent.id}] sending:`, msg);
     try {
       await streamMessage(agent.id, msg, img, ev => {
         if (ev.type === 'text') appendToLast(ev.text);
-        else if (ev.type === 'tool_start') { console.log(`[agent:${agent.id}] tool start:`, ev.name); addMsg('tool', `Running ${ev.name}…`, 'tool_start'); }
-        else if (ev.type === 'tool_result') { console.log(`[agent:${agent.id}] tool result:`, ev.name, ev.result?.slice(0, 100)); addMsg('tool', `${ev.name} → ${ev.result}`, 'tool_result'); }
-        else if (ev.type === 'done') { console.log(`[agent:${agent.id}] done`); finalizeStream(); }
-        else if (ev.type === 'error') { console.error(`[agent:${agent.id}] error:`, ev.text); addMsg('assistant', `Error: ${ev.text}`, 'error'); }
+        else if (ev.type === 'tool_start') addMsg('tool', `Running ${ev.name}…`, 'tool_start');
+        else if (ev.type === 'tool_result') addMsg('tool', `${ev.name} → ${ev.result}`, 'tool_result');
+        else if (ev.type === 'done') finalizeStream();
+        else if (ev.type === 'error') addMsg('assistant', `Error: ${ev.text}`, 'error');
       });
       await sendSummaryRequest();
     } catch (e) {
-      console.error(`[agent:${agent.id}] connection error:`, e);
       addMsg('assistant', `Connection error: ${e.message}`, 'error');
     } finally {
-      console.log(`[agent:${agent.id}] busy cleared`);
       setBusy(false);
       onRefresh?.();
     }
+  };
+
+  const handleUndo = async () => {
+    if (!confirm('Discard all uncommitted changes on this branch?')) return;
+    try {
+      const d = await api(`/api/agents/${agent.id}/undo`, 'POST');
+      notify?.(d.ok ? 'Changes discarded' : (d.output || 'Undo failed'), d.ok ? 'success' : 'error');
+    } catch (e) { notify?.(e.message, 'error'); }
+  };
+
+  const loadAgentLog = async () => {
+    try {
+      const d = await api(`/api/agents/${agent.id}/log`);
+      setAgentCommits(d.commits || []);
+      setShowLog(true);
+    } catch {}
+  };
+
+  const handleAgentRevert = async (hash, message) => {
+    if (!confirm(`Revert "${message}"?\nThis creates a new commit that undoes it.`)) return;
+    try {
+      const d = await api('/api/git/revert', 'POST', { commit: hash });
+      notify?.(d.ok ? 'Reverted' : (d.error || 'Revert failed'), d.ok ? 'success' : 'error');
+      if (d.ok) loadAgentLog();
+    } catch (e) { notify?.(e.message, 'error'); }
   };
 
   const onKey = e => {
@@ -493,7 +676,15 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge, onRefresh }) {
             {agent.branch}
           </span>
         </div>
-        <div className="flex items-center gap-1 mt-0.5">
+        <div className="flex items-center gap-1 mt-0.5 flex-wrap justify-end">
+          <button onClick={handleUndo} title="Discard uncommitted changes"
+            className="text-[11px] px-2 py-1 rounded-lg text-gray-500 hover:text-orange-400 hover:bg-orange-950/30 transition-colors">
+            ↩ undo
+          </button>
+          <button onClick={() => showLog ? setShowLog(false) : loadAgentLog()}
+            className={`text-[11px] px-2 py-1 rounded-lg transition-colors ${showLog ? 'text-white bg-[#2a2a2a]' : 'text-gray-500 hover:text-white hover:bg-[#2a2a2a]'}`}>
+            history
+          </button>
           <button onClick={() => onPush(agent.branch)}
             className="text-[11px] px-2 py-1 rounded-lg text-gray-500 hover:text-white hover:bg-[#2a2a2a] transition-colors">
             ↑ push
@@ -502,8 +693,7 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge, onRefresh }) {
             className="text-[11px] px-2 py-1 rounded-lg text-gray-500 hover:text-green-400 hover:bg-green-950/30 transition-colors">
             → main
           </button>
-          <button onClick={onClose}
-            title="Close panel"
+          <button onClick={onClose} title="Close panel"
             className="p-1 rounded-lg text-gray-600 hover:text-white hover:bg-[#2a2a2a] transition-colors text-sm">
             ✕
           </button>
@@ -514,6 +704,25 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge, onRefresh }) {
           </button>
         </div>
       </div>
+
+      {/* Per-agent commit log */}
+      {showLog && (
+        <div className="border-b border-[#1e1e1e] bg-[#0d0d0d] flex-shrink-0 max-h-40 overflow-y-auto">
+          {agentCommits.length === 0
+            ? <div className="px-3 py-2 text-xs text-gray-600">No commits on this branch</div>
+            : agentCommits.map(c => (
+              <div key={c.hash} className="flex items-center gap-2 px-3 py-1.5 hover:bg-[#111] group border-b border-[#141414]">
+                <span className="font-mono text-[10px] text-gray-600 flex-shrink-0">{c.hash}</span>
+                <span className="text-xs text-gray-400 flex-1 truncate">{c.message}</span>
+                <button onClick={() => handleAgentRevert(c.hash, c.message)}
+                  className="text-[10px] px-1.5 py-0.5 rounded text-gray-700 hover:text-red-400 hover:bg-red-950/30 transition-colors opacity-0 group-hover:opacity-100 flex-shrink-0">
+                  ↩
+                </button>
+              </div>
+            ))
+          }
+        </div>
+      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto py-2 min-h-0">
@@ -555,7 +764,7 @@ function AgentPanel({ agent, onDelete, onPush, onClose, onMerge, onRefresh }) {
   );
 }
 
-// ─── Branch Switcher ─────────────────────────────────────────────────────────
+// ─── Branch Switcher ──────────────────────────────────────────────────────────
 function BranchSwitcher({ currentBranch, dirty, onSwitch }) {
   const [branches, setBranches] = useState([]);
   const [open, setOpen] = useState(false);
@@ -597,17 +806,19 @@ function BranchSwitcher({ currentBranch, dirty, onSwitch }) {
   );
 }
 
-// ─── App ─────────────────────────────────────────────────────────────────────
+// ─── App ──────────────────────────────────────────────────────────────────────
 function App() {
   const [settings, setSettings] = useState({
-    repo_path: '', github_repo: '', github_token: '', start_command: 'npm run dev', app_port: 3000,
+    active: 0,
+    repos: [{ name: '', repo_path: '', github_repo: '', github_token: '', start_command: 'npm run dev', app_port: 3000 }],
   });
   const [showSettings, setShowSettings] = useState(false);
+  const [showAddRepo, setShowAddRepo] = useState(false);
   const [agentList, setAgentList] = useState([]);
   const [openAgents, setOpenAgents] = useState(new Set());
   const [gitInfo, setGitInfo]     = useState({ branch: '…', status: '' });
-  const [viewMode, setViewMode]   = useState('desktop'); // 'desktop'|'mobile'|'tablet'|'fullscreen'
-  const [previewWidth, setPreviewWidth] = useState(46); // viewport %, clamped 20–80
+  const [viewMode, setViewMode]   = useState('desktop');
+  const [previewWidth, setPreviewWidth] = useState(46);
   const [isDragging, setIsDragging]     = useState(false);
   const [appRunning, setAppRunning] = useState(false);
   const [appStarting, setAppStarting] = useState(false);
@@ -626,11 +837,11 @@ function App() {
 
   const notify = (msg, type = 'success') => setToast({ message: msg, type });
 
-  // Derived values from settings
-  const repoName = settings.repo_path
-    ? settings.repo_path.replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'project'
-    : null;
-  const previewUrl = `http://localhost:${settings.app_port || 3000}`;
+  const activeRepo = settings.repos?.[settings.active] || {};
+  const repoName = activeRepo.name || (activeRepo.repo_path
+    ? activeRepo.repo_path.replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'project'
+    : null);
+  const previewUrl = `http://localhost:${activeRepo.app_port || 3000}`;
 
   useEffect(() => {
     document.title = repoName ? `Agent Studio — ${repoName}` : 'Agent Studio';
@@ -638,9 +849,9 @@ function App() {
 
   const loadSettings = async () => {
     try {
-      const s = await api('/api/settings');
+      const s = await api('/api/repos');
       setSettings(s);
-      if (!s.repo_path) setShowSettings(true);
+      if (!s.repos?.length || !s.repos[s.active]?.repo_path) setShowSettings(true);
     } catch {}
   };
 
@@ -698,13 +909,34 @@ function App() {
     } catch {}
   };
 
+  const handleSwitchRepo = async (index) => {
+    try {
+      await api(`/api/repos/${index}/activate`, 'POST');
+      await loadSettings();
+      refreshGit();
+      setAppRunning(false);
+      stopLogPolling();
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
+  const handleAddRepo = async (repoConfig) => {
+    try {
+      await api('/api/repos', 'POST', repoConfig);
+      const s = await api('/api/repos');
+      await api(`/api/repos/${s.repos.length - 1}/activate`, 'POST');
+      await loadSettings();
+      setShowAddRepo(false);
+      notify('Repo added');
+      refreshGit();
+    } catch (e) { notify(e.message, 'error'); }
+  };
+
   const handlePull = async () => {
     setPulling(true);
     try {
       const d = await api('/api/git/pull', 'POST');
       if (!d.ok) {
         notify(d.output, 'error');
-        try { const l = await api('/api/app/logs'); setAppLogs(l.logs || []); setShowLogs(true); } catch {}
       } else {
         const msg = d.output?.toLowerCase().includes('up to date') ? 'Already up to date' : (d.output || 'Pulled successfully');
         notify(msg);
@@ -851,13 +1083,18 @@ function App() {
 
       {/* ── Top bar ── */}
       <header className="flex items-center gap-2 px-4 h-12 border-b border-[#1e1e1e] bg-[#0d0d0d] flex-shrink-0">
-        {/* Logo + repo */}
+        {/* Logo + repo switcher */}
         <div className="flex items-center gap-1.5 mr-3">
           <div className="w-2 h-2 rounded-full bg-indigo-500 flex-shrink-0" />
           <span className="text-sm font-semibold">Agent Studio</span>
-          {repoName && <>
+          {settings.repos?.length > 0 && <>
             <span className="text-gray-700 mx-0.5">/</span>
-            <span className="text-gray-400 text-sm">{repoName}</span>
+            <RepoSwitcher
+              repos={settings.repos}
+              active={settings.active}
+              onSwitch={handleSwitchRepo}
+              onAdd={() => setShowAddRepo(true)}
+            />
           </>}
         </div>
 
@@ -913,9 +1150,7 @@ function App() {
           ↩ History
         </button>
 
-        {/* Settings gear */}
-        <button onClick={() => setShowSettings(true)}
-          title="Settings"
+        <button onClick={() => setShowSettings(true)} title="Settings"
           className="p-1.5 rounded-lg text-gray-600 hover:text-gray-300 hover:bg-[#1e1e1e] transition-colors text-base leading-none">
           ⚙
         </button>
@@ -947,7 +1182,7 @@ function App() {
         <div className="flex-shrink-0 flex flex-col bg-[#0c0c0c]"
           style={{ width: viewMode === 'fullscreen' ? '100%' : `${previewWidth}%` }}>
           <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1e1e1e] bg-[#0f0f0f]">
-            <span className="text-[11px] text-gray-600 font-mono">localhost:{settings.app_port || 3000}</span>
+            <span className="text-[11px] text-gray-600 font-mono">localhost:{activeRepo.app_port || 3000}</span>
             <div className="flex items-center gap-2">
               {viewMode === 'fullscreen' && (
                 <button onClick={() => setViewMode('desktop')}
@@ -955,7 +1190,7 @@ function App() {
                   ✕ Exit full
                 </button>
               )}
-              {(appLogs.length > 0) && (
+              {appLogs.length > 0 && (
                 <button onClick={() => setShowLogs(v => !v)}
                   className={`text-[11px] px-2 py-0.5 rounded transition-colors ${showLogs ? 'text-indigo-400 bg-indigo-950/50' : 'text-gray-600 hover:text-gray-300 hover:bg-[#1e1e1e]'}`}>
                   {showLogs ? 'Hide logs' : 'Show logs'}
@@ -999,8 +1234,7 @@ function App() {
                   <iframe ref={iframeRef} src={previewUrl} title="preview" />
                 </div>
               ) : (
-                <iframe ref={iframeRef} src={previewUrl} title="preview"
-                  className="w-full h-full border-none" />
+                <iframe ref={iframeRef} src={previewUrl} title="preview" className="w-full h-full border-none" />
               )
             ) : (
               <div className="flex flex-col items-center justify-center h-full gap-3 text-center px-4">
@@ -1028,7 +1262,7 @@ function App() {
                           Start {repoName}
                         </button>
                         <p className="text-xs text-gray-700">
-                          or run <code className="bg-[#1e1e1e] px-1.5 py-0.5 rounded font-mono">{settings.start_command}</code> manually
+                          or run <code className="bg-[#1e1e1e] px-1.5 py-0.5 rounded font-mono">{activeRepo.start_command}</code> manually
                         </p>
                       </>
                     ) : (
@@ -1096,7 +1330,8 @@ function App() {
                   onDelete={handleDeleteAgent} onPush={handlePush}
                   onClose={() => toggleAgent(agent.id)}
                   onMerge={handleMergeToMain}
-                  onRefresh={loadAgents} />
+                  onRefresh={loadAgents}
+                  notify={notify} />
               ))}
               {openAgents.size === 0 && (
                 <div className="flex items-center justify-center flex-1 text-gray-700 text-sm">
@@ -1114,7 +1349,14 @@ function App() {
         <SettingsModal
           settings={settings}
           onClose={() => setShowSettings(false)}
-          onSave={s => { setSettings(s); refreshGit(); notify('Settings saved'); }}
+          onSave={async () => { await loadSettings(); refreshGit(); notify('Settings saved'); }}
+        />
+      )}
+      {showAddRepo && (
+        <AddRepoModal
+          onClose={() => setShowAddRepo(false)}
+          onSave={handleAddRepo}
+          hasToken={!!(activeRepo.github_token && activeRepo.github_token !== '')}
         />
       )}
       {showNewAgent && <NewAgentModal onClose={() => setShowNewAgent(false)} onCreate={handleCreateAgent} />}
